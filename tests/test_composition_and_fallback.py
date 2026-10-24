@@ -38,7 +38,7 @@ class TestComposition(unittest.TestCase):
             quota_provider="openai-codex",
             now=self.now,
         )
-        expected = "`gpt-6.1-sol · low · ctx 24% · 5h 18% (18:40) · 7j 39% (31/10 09:00)`"
+        expected = "`gpt-6.1-sol · low (configured) · ctx 24% · 5h 18% (18:40) · 7j 39% (31/10 09:00)`"
         self.assertEqual(line, expected)
         self.assertEqual(len(line.splitlines()), 1)
 

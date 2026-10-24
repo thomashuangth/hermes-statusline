@@ -100,7 +100,7 @@ class TestProviderDisplayIsolation(unittest.TestCase):
             quota_provider=None,
             now=self.now,
         )
-        self.assertEqual(line, "`mystery-model · low · ctx 5%`")
+        self.assertEqual(line, "`mystery-model · low (configured) · ctx 5%`")
         self.assertNotIn("5h", line)
         self.assertNotIn("credit", line)
 

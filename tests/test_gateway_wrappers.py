@@ -1,9 +1,12 @@
 """Tests for gateway mixin wrappers, strict compatibility checks, idempotent reload, and safe unload."""
 
 import inspect
+import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -106,7 +109,7 @@ class TestGatewayCompatibility(unittest.TestCase):
         with patch.dict(sys.modules, stubs):
             compatible, reason = sl.check_gateway_compatibility()
             self.assertTrue(compatible)
-            self.assertEqual(reason, "compatible")
+            self.assertTrue(reason.startswith("compatible"))
 
 
 class TestGatewayPatchingAndUnload(unittest.TestCase):
@@ -219,6 +222,188 @@ class TestOptionsDisabled(unittest.TestCase):
             self.assertEqual(rendered, "native_footer_text")
 
             sl.unregister()
+
+
+class TestCompatibilityStrategyGuards(unittest.TestCase):
+    def test_legacy_missing_session_finite_with_wrong_hash_rejected(self):
+        stubs = _make_stub_gateway()
+        stubs["gateway.session_finite"] = None
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("wrong hash gateway.run_turn content\n")
+            tf_path = tf.name
+        try:
+            stubs["gateway.run_turn"].__file__ = tf_path
+            with patch.dict(sys.modules, stubs):
+                compatible, reason = sl.check_gateway_compatibility()
+                self.assertFalse(compatible)
+                self.assertIn("hash mismatch", reason)
+                self.assertNotEqual(sl._active_compatibility_strategy, "legacy_pi_adapter")
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+    def test_legacy_missing_session_finite_with_correct_pi_hash_accepted(self):
+        stubs = _make_stub_gateway()
+        stubs["gateway.session_finite"] = None
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("pi_run_turn")
+            tf_path = tf.name
+        try:
+            stubs["gateway.run_turn"].__file__ = tf_path
+            with patch.dict(sys.modules, stubs):
+                with patch("pathlib.Path.read_bytes", return_value=b"pi_content"):
+                    with patch("hashlib.sha256") as mock_sha:
+                        mock_sha.return_value.hexdigest.return_value = sl.PI_RUN_TURN_SHA256
+                        compatible, reason = sl.check_gateway_compatibility()
+                        self.assertTrue(compatible)
+                        self.assertIn("legacy_pi_adapter", reason)
+                        self.assertEqual(sl._active_compatibility_strategy, "legacy_pi_adapter")
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+    def test_modern_broken_session_finite_rejected_without_fallback(self):
+        stubs = _make_stub_gateway()
+        stubs["gateway.session_finite"].finite_turn_required = "not_callable"
+        with patch.dict(sys.modules, stubs):
+            with patch("hashlib.sha256") as mock_sha:
+                mock_sha.return_value.hexdigest.return_value = sl.PI_RUN_TURN_SHA256
+                compatible, reason = sl.check_gateway_compatibility()
+                self.assertFalse(compatible)
+                self.assertIn("finite_turn_required", reason)
+                self.assertNotEqual(sl._active_compatibility_strategy, "legacy_pi_adapter")
+
+    def test_modern_broken_session_finite_with_arguments_rejected(self):
+        stubs = _make_stub_gateway()
+        stubs["gateway.session_finite"].finite_turn_required = lambda required_arg: False
+        with patch.dict(sys.modules, stubs):
+            compatible, reason = sl.check_gateway_compatibility()
+            self.assertFalse(compatible)
+            self.assertIn("zero arguments", reason)
+            self.assertNotEqual(sl._active_compatibility_strategy, "legacy_pi_adapter")
+
+
+class TestReceiptAtomicityAndGenerations(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.env_patch = patch.dict(os.environ, {"HERMES_HOME": self.tmp_dir.name})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+        self.stubs = _make_stub_gateway()
+        self.sys_modules_patch = patch.dict(sys.modules, self.stubs)
+        self.sys_modules_patch.start()
+        self.addCleanup(self.sys_modules_patch.stop)
+
+    def test_receipt_io_failure_rolls_back_atomically(self):
+        mixin = self.stubs["gateway.run_turn"].GatewayTurnMixin
+        orig_footer = mixin._hmwa_runtime_footer_line
+
+        with patch("builtins.open", side_effect=OSError("Disk write error")):
+            res = sl.register()
+            self.assertEqual(res["status"], "incompatible")
+            self.assertIn("receipt write failed", res["reason"])
+            self.assertIs(mixin._hmwa_runtime_footer_line, orig_footer)
+            self.assertIsNone(sl._active_registration_token)
+
+    def test_unload_older_generation_does_not_delete_newer_receipt(self):
+        res1 = sl.register()
+        self.assertEqual(res1["status"], "ok")
+        tok1 = sl._active_registration_token
+        receipt_path = Path(res1["receipt"])
+        self.assertTrue(receipt_path.exists())
+
+        res2 = sl.register()
+        self.assertEqual(res2["status"], "ok")
+        tok2 = sl._active_registration_token
+        self.assertIsNot(tok1, tok2)
+        self.assertTrue(receipt_path.exists())
+
+        status1 = sl.unpatch_gateway(tok1)
+        self.assertFalse(status1["footer"])
+        self.assertFalse(status1["persist"])
+        self.assertTrue(receipt_path.exists())
+
+        status2 = sl.unpatch_gateway(tok2)
+        self.assertTrue(status2["footer"])
+        self.assertTrue(status2["persist"])
+        self.assertFalse(receipt_path.exists())
+
+
+class TestFiniteTurnSemantics(unittest.TestCase):
+    def test_modern_is_finite_turn_tri_state(self):
+        stubs = _make_stub_gateway()
+        with patch.dict(sys.modules, stubs):
+            sl._active_compatibility_strategy = "session_finite_v1"
+
+            stubs["gateway.session_finite"].finite_turn_required = lambda: None
+            self.assertFalse(sl.is_finite_turn())
+
+            stubs["gateway.session_finite"].finite_turn_required = lambda: False
+            self.assertFalse(sl.is_finite_turn())
+
+            stubs["gateway.session_finite"].finite_turn_required = lambda: True
+            self.assertTrue(sl.is_finite_turn())
+
+    def test_modern_is_finite_turn_exception_fails_closed(self):
+        stubs = _make_stub_gateway()
+        def broken():
+            raise RuntimeError("context lost")
+
+        stubs["gateway.session_finite"].finite_turn_required = broken
+        with patch.dict(sys.modules, stubs):
+            sl._active_compatibility_strategy = "session_finite_v1"
+            self.assertTrue(sl.is_finite_turn())
+
+    def test_legacy_pi_adapter_is_finite_turn_always_false(self):
+        sl._active_compatibility_strategy = "legacy_pi_adapter"
+        self.assertFalse(sl.is_finite_turn())
+
+
+class TestLegacyPiPlatformGuard(unittest.TestCase):
+    def setUp(self):
+        def orig_footer(self, agent_result, source, turn_seconds):
+            return "native_pi_line"
+
+        self.stubs = _make_stub_gateway(footer_fn=orig_footer)
+        self.sys_modules_patch = patch.dict(sys.modules, self.stubs)
+        self.sys_modules_patch.start()
+        self.addCleanup(self.sys_modules_patch.stop)
+
+    def test_telegram_platform_renders_statusline_on_legacy_pi(self):
+        sl.register()
+        sl._active_compatibility_strategy = "legacy_pi_adapter"
+        mixin = self.stubs["gateway.run_turn"].GatewayTurnMixin
+
+        runner = SimpleNamespace(
+            _session_key_for_source=lambda s: "sess:1",
+            _peek_session_state=lambda k: None,
+            _session_model_override=lambda k: None,
+            _resolve_session_reasoning_config=lambda **kw: None,
+        )
+        source = SimpleNamespace(platform="telegram")
+        result = {"model": "gpt-6.1-sol"}
+
+        rendered = mixin._hmwa_runtime_footer_line(runner, result, source, 1.0)
+        self.assertIn("stub_native_footer", rendered)
+        sl.unregister()
+
+    def test_non_telegram_platform_preserves_native_line_on_legacy_pi(self):
+        sl.register()
+        sl._active_compatibility_strategy = "legacy_pi_adapter"
+        mixin = self.stubs["gateway.run_turn"].GatewayTurnMixin
+
+        runner = SimpleNamespace(
+            _session_key_for_source=lambda s: "sess:1",
+            _peek_session_state=lambda k: None,
+            _session_model_override=lambda k: None,
+            _resolve_session_reasoning_config=lambda **kw: None,
+        )
+        source = SimpleNamespace(platform="slack")
+        result = {"model": "gpt-6.1-sol"}
+
+        rendered = mixin._hmwa_runtime_footer_line(runner, result, source, 1.0)
+        self.assertEqual(rendered, "native_pi_line")
+        sl.unregister()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 name: hermes-statusline
-version: "1.0.0"
+version: "1.0.1"
 description: "Portable monospace statusline footer for Hermes agent final turns: served model, reasoning effort, context usage%, provider quota consumption (5h/weekly resets) or credit balance, with conservative fallback recovery ETA."
 author: "Thomas Huang"
 homepage: "https://github.com/thomashuangth/hermes-statusline"

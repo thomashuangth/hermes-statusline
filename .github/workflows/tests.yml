@@ -1,18 +1,71 @@
 name: tests
 on: [push, pull_request]
+
 permissions:
   contents: read
+
 jobs:
   unittest:
+    name: Unit Tests (${{ matrix.os }} - Py${{ matrix.python }})
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ['3.11', '3.14']
+        python: ['3.10', '3.11']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Isolated standard-library tests
-        run: bash scripts/run_tests.sh
+      - name: Run isolated unit test suite
+        run: |
+          bash scripts/run_tests.sh
+
+  integration:
+    name: Real-Core Integration (${{ matrix.core_name }})
+    strategy:
+      matrix:
+        include:
+          - core_name: "Raspberry Pi Core (4f9b741a)"
+            commit: "4f9b741a3a0284ecce31dc7e4cffde49173ec764"
+            expected_hash: "dc0829d1d8c7d521502f847442ecb3386b7671268047372e22f6da263417be66"
+            strategy: "legacy_pi_adapter"
+          - core_name: "Modern Core (bf0203a7)"
+            commit: "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
+            expected_hash: "d26c177a4c0edcdd8f901d4b1b7db789c1aa534d72177645afdab32af5509b7d"
+            strategy: "session_finite_v1"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install minimal core runtime dependencies
+        run: |
+          pip install --no-cache-dir ruamel.yaml pydantic aiohttp httpx python-dotenv requests psutil click pygments rich jiter
+
+      - name: Fetch and verify official pinned Hermes core archive
+        run: |
+          mkdir -p /tmp/cores
+          curl -sSL "https://github.com/NousResearch/Hermes-Agent/archive/${{ matrix.commit }}.tar.gz" -o /tmp/cores/core.tar.gz
+          mkdir -p /tmp/cores/extracted
+          tar -xzf /tmp/cores/core.tar.gz -C /tmp/cores/extracted --strip-components=1
+
+          # Verify run_turn.py hash matches pinned constant exactly
+          ACTUAL_HASH=$(sha256sum /tmp/cores/extracted/gateway/run_turn.py | awk '{print $1}')
+          echo "Expected hash: ${{ matrix.expected_hash }}"
+          echo "Actual hash:   ${ACTUAL_HASH}"
+          if [ "${ACTUAL_HASH}" != "${{ matrix.expected_hash }}" ]; then
+            echo "Error: run_turn.py sha256 mismatch!"
+            exit 1
+          fi
+
+      - name: Run real-core integration tests
+        env:
+          HERMES_TEST_CORE: "/tmp/cores/extracted"
+          HERMES_DISABLE_LAZY_INSTALLS: "1"
+        run: |
+          TEST_HOME="$(mktemp -d)"
+          mkdir -p "$TEST_HOME/hermes"
+          HOME="$TEST_HOME" HERMES_HOME="$TEST_HOME/hermes" HERMES_DISABLE_LAZY_INSTALLS=1 python -m unittest discover -s tests_integration -p "test_*.py" -v

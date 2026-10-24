@@ -10,13 +10,13 @@ from _helpers import sl
 
 class TestEffortFormatter(unittest.TestCase):
     def test_effort_values(self):
-        self.assertEqual(sl.format_effort(None), "default")
-        self.assertEqual(sl.format_effort({}), "default")
-        self.assertEqual(sl.format_effort({"enabled": False, "effort": "high"}), "none")
-        self.assertEqual(sl.format_effort({"enabled": True, "effort": "low"}), "low")
-        self.assertEqual(sl.format_effort({"enabled": True, "effort": "medium"}), "medium")
-        self.assertEqual(sl.format_effort({"enabled": True, "effort": "high"}), "high")
-        self.assertEqual(sl.format_effort({"enabled": True}), "default")
+        self.assertEqual(sl.format_effort(None), "")
+        self.assertEqual(sl.format_effort({}), "")
+        self.assertEqual(sl.format_effort({"enabled": False, "effort": "high"}), "none (configured)")
+        self.assertEqual(sl.format_effort({"enabled": True, "effort": "low"}), "low (configured)")
+        self.assertEqual(sl.format_effort({"enabled": True, "effort": "medium"}), "medium (configured)")
+        self.assertEqual(sl.format_effort({"enabled": True, "effort": "high"}), "high (configured)")
+        self.assertEqual(sl.format_effort({"enabled": True}), "")
         self.assertEqual(sl.format_effort("invalid"), "")
 
 

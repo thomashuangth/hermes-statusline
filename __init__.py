@@ -18,11 +18,13 @@ Fallback behavior:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import math
 import os
+import sys
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -32,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "hermes-statusline"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 FORMAT_VERSION = "compact-mono-active-v1"
 
 NATIVE_FIELDS = ("model", "served_model", "context_pct", "latency", "cwd")
@@ -69,6 +71,15 @@ _WRAPPER_PATCH_MARKER = "_hermes_statusline_patched"
 _active_registration_token: Optional[object] = None
 _active_footer_wrapper: Optional[Callable] = None
 _active_persist_wrapper: Optional[Callable] = None
+_active_compatibility_strategy: str = "unknown"
+_active_interfaces: List[str] = []
+
+# Pinned Gateway Core Hashes & Commit Targets
+PI_CORE_COMMIT = "4f9b741a3a0284ecce31dc7e4cffde49173ec764"
+PI_RUN_TURN_SHA256 = "dc0829d1d8c7d521502f847442ecb3386b7671268047372e22f6da263417be66"
+
+ORIG_CORE_COMMIT = "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
+ORIG_RUN_TURN_SHA256 = "d26c177a4c0edcdd8f901d4b1b7db789c1aa534d72177645afdab32af5509b7d"
 
 
 # ============================================================================
@@ -323,15 +334,19 @@ def format_credit(
 
 
 def format_effort(reasoning_config: Any) -> str:
-    """Format applied reasoning effort: 'none', 'low', 'medium', 'high', or 'default'."""
-    if reasoning_config is None:
-        return "default"
+    """Format configured reasoning effort.
+
+    Labeled '(configured)', never claims provider confirmation.
+    Absent or empty effort returns empty string (avoids invented default).
+    """
     if not isinstance(reasoning_config, dict):
         return ""
     if reasoning_config.get("enabled") is False:
-        return "none"
+        return "none (configured)"
     effort = str(reasoning_config.get("effort") or "").strip()
-    return effort or "default"
+    if not effort:
+        return ""
+    return f"{effort} (configured)"
 
 
 def format_ctx(context_tokens: Any, context_length: Any) -> str:
@@ -833,14 +848,25 @@ async def persist_without_footer(
 def is_finite_turn() -> bool:
     """Check if the turn requires finite turn behavior (zero-argument call).
 
-    Fails closed (returns True) if the gateway module is unavailable or throws.
+    On modern core: evaluates gateway.session_finite.finite_turn_required().
+    Respects tri-state ContextVar (True/False/None): NEVER substitutes unconditional False.
+    Only returns True when finite_turn_required() is True.
+    On legacy Pi core (Raspberry Pi 4f9b741a): legacy core has no finite gateway turns;
+    all turns render (returns False).
+    Fails closed (returns True) if gateway throws an unexpected error.
     """
+    if _active_compatibility_strategy == "legacy_pi_adapter":
+        return False
+
     try:
         from gateway.session_finite import finite_turn_required
-        return finite_turn_required() is True
+        if callable(finite_turn_required):
+            res = finite_turn_required()
+            return res is True
     except Exception as exc:
         logger.debug("Failed finite_turn_required check: %s; failing closed", exc)
         return True
+    return False
 
 
 def _get_shared_context_var() -> ContextVar:
@@ -867,8 +893,16 @@ def _set_turn_footer_context(runner_id: int, result_id: int, line: str) -> None:
 def check_gateway_compatibility() -> Tuple[bool, str]:
     """Strict signature and compatibility checks for GatewayTurnMixin private seams.
 
-    Fails closed if internal interfaces are missing or unsupported.
+    Evaluates interface availability and selects appropriate compatibility strategy:
+    - 'session_finite_v1': modern core with gateway.session_finite
+    - 'legacy_pi_adapter': legacy core (Raspberry Pi 4f9b741a) lacking gateway.session_finite
+
+    Fails closed if internal interfaces are missing, broken, or unsupported.
     """
+    global _active_compatibility_strategy, _active_interfaces
+    _active_compatibility_strategy = "unknown"
+    _active_interfaces = []
+
     try:
         from gateway import run_turn
     except Exception as exc:
@@ -931,23 +965,152 @@ def check_gateway_compatibility() -> Tuple[bool, str]:
     except Exception as exc:
         return False, f"cannot import gateway.runtime_footer: {exc}"
 
-    # 4. Check gateway.session_finite.finite_turn_required is a zero-arg callable
-    try:
-        from gateway import session_finite
-        fn = getattr(session_finite, "finite_turn_required", None)
-        if not callable(fn):
-            return False, "gateway.session_finite.finite_turn_required missing or not callable"
-        sig_finite = inspect.signature(fn)
-        req_finite = [
-            p for p in sig_finite.parameters.values()
-            if p.default == inspect.Parameter.empty and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        ]
-        if len(req_finite) != 0:
-            return False, f"gateway.session_finite.finite_turn_required must accept zero arguments, got {list(sig_finite.parameters.keys())}"
-    except Exception as exc:
-        return False, f"cannot import gateway.session_finite: {exc}"
+    verified = [
+        "GatewayTurnMixin._hmwa_runtime_footer_line",
+        "GatewayTurnMixin._hmwa_persist_turn_transcript",
+        "gateway.runtime_footer.format_runtime_footer",
+        "gateway.runtime_footer.resolve_footer_config",
+    ]
 
-    return True, "compatible"
+    # 4. Check finite turn seam:
+    # Modern core has gateway.session_finite; Pi core (4f9b741a) lacks it.
+    # Use find_spec to detect whether gateway.session_finite genuinely exists.
+    import importlib.util
+    has_session_finite = False
+    try:
+        if "gateway.session_finite" in sys.modules:
+            mod = sys.modules["gateway.session_finite"]
+            has_session_finite = mod is not None
+        else:
+            spec = importlib.util.find_spec("gateway.session_finite")
+            has_session_finite = spec is not None
+    except Exception as exc:
+        return False, f"failed to inspect module spec for gateway.session_finite: {exc}"
+
+    if has_session_finite:
+        # Modern core path: gateway.session_finite MUST be valid.
+        # Existing modern module import failure/missing fn MUST NOT fall back legacy!
+        try:
+            from gateway import session_finite
+            fn = getattr(session_finite, "finite_turn_required", None)
+            if not callable(fn):
+                return False, "gateway.session_finite.finite_turn_required missing or not callable"
+            sig_finite = inspect.signature(fn)
+            req_finite = [
+                p for p in sig_finite.parameters.values()
+                if p.default == inspect.Parameter.empty and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            ]
+            if len(req_finite) != 0:
+                return False, f"gateway.session_finite.finite_turn_required must accept zero arguments, got {list(sig_finite.parameters.keys())}"
+            verified.append("gateway.session_finite.finite_turn_required")
+            _active_compatibility_strategy = "session_finite_v1"
+            _active_interfaces = verified
+            return True, "compatible: session_finite_v1"
+        except Exception as exc:
+            return False, f"gateway.session_finite validation failed: {exc}"
+
+    # Legacy Pi core path: gateway.session_finite is genuinely absent.
+    # Strict exact-source SHA256 guard: MUST match official Pi commit 4f9b741a run_turn.py hash.
+    run_turn_file = getattr(run_turn, "__file__", None)
+    if not run_turn_file:
+        return False, "legacy gateway core missing session_finite and gateway.run_turn has no __file__"
+
+    run_turn_path = Path(run_turn_file).resolve()
+    if not run_turn_path.is_file():
+        return False, f"legacy gateway core run_turn file not found: {run_turn_path}"
+
+    run_turn_sha256 = hashlib.sha256(run_turn_path.read_bytes()).hexdigest()
+    if run_turn_sha256 != PI_RUN_TURN_SHA256:
+        return False, (
+            f"legacy gateway core missing session_finite and run_turn.py hash mismatch "
+            f"(expected {PI_RUN_TURN_SHA256}, got {run_turn_sha256})"
+        )
+
+    _active_compatibility_strategy = "legacy_pi_adapter"
+    verified.append("legacy_pi_adapter")
+    _active_interfaces = verified
+    return True, "compatible: legacy_pi_adapter"
+
+
+def resolve_core_identity() -> Dict[str, Any]:
+    """Inspect and return runtime core identity where verifiable via on-disk source hashes."""
+    identity: Dict[str, Any] = {
+        "run_turn_path": None,
+        "run_turn_sha256": None,
+        "core_commit": None,
+    }
+    try:
+        from gateway import run_turn
+        rt_file = getattr(run_turn, "__file__", None)
+        if rt_file:
+            p = Path(rt_file).resolve()
+            identity["run_turn_path"] = str(p)
+            if p.is_file():
+                h = hashlib.sha256(p.read_bytes()).hexdigest()
+                identity["run_turn_sha256"] = h
+                if h == PI_RUN_TURN_SHA256:
+                    identity["core_commit"] = PI_CORE_COMMIT
+                elif h == ORIG_RUN_TURN_SHA256:
+                    identity["core_commit"] = ORIG_CORE_COMMIT
+    except Exception as exc:
+        logger.debug("Failed resolving core identity: %s", exc)
+    return identity
+
+
+def write_registration_receipt(
+    strategy: str,
+    interfaces: List[str],
+    core_identity: Dict[str, Any],
+    token: object,
+) -> Path:
+    """Record registration receipt at state/hermes_statusline/loaded-<pid>.json."""
+    pid = os.getpid()
+    receipt_dir = get_hermes_home() / "state" / "hermes_statusline"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_file = receipt_dir / f"loaded-{pid}.json"
+
+    source_path = Path(__file__).resolve()
+    sha256_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    receipt_data = {
+        "pid": pid,
+        "token_id": id(token),
+        "plugin_source_path": str(source_path),
+        "plugin_source_sha256": sha256_hash,
+        "version": VERSION,
+        "compatibility_strategy": strategy,
+        "interfaces": interfaces,
+        "core_identity": core_identity,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    temp_file = receipt_dir / f"loaded-{pid}.tmp.{os.getpid()}.{id(token)}"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(receipt_data, f, indent=2)
+    temp_file.replace(receipt_file)
+    return receipt_file
+
+
+def cleanup_registration_receipt(token: Optional[object] = None) -> bool:
+    """Remove registration receipt on unload if receipt belongs to the provided token."""
+    try:
+        pid = os.getpid()
+        receipt_file = get_hermes_home() / "state" / "hermes_statusline" / f"loaded-{pid}.json"
+        if not receipt_file.exists():
+            return False
+        if token is not None:
+            try:
+                data = json.loads(receipt_file.read_text(encoding="utf-8"))
+                if data.get("token_id") != id(token):
+                    # Newer or different generation receipt, do not delete
+                    return False
+            except Exception:
+                pass
+        receipt_file.unlink()
+        return True
+    except Exception:
+        pass
+    return False
 
 
 def patch_footer_line(token: object) -> str:
@@ -980,10 +1143,30 @@ def patch_footer_line(token: object) -> str:
 
         line = original(self, agent_result, source, turn_seconds, *args, **kwargs)
 
+        # Legacy Pi core platform guard:
+        # Telegram is the proven supported messaging platform for legacy Pi core.
+        # If not Telegram on legacy Pi adapter, preserve exact old native behavior.
+        platform_val = getattr(source, "platform", None) if source else None
+        if hasattr(platform_val, "value"):
+            platform_str = str(platform_val.value)
+        elif isinstance(platform_val, str):
+            platform_str = platform_val
+        else:
+            platform_str = ""
+
+        if _active_compatibility_strategy == "legacy_pi_adapter":
+            if platform_str != "telegram":
+                _set_turn_footer_context(id(self), id(agent_result), line)
+                return line
+
         try:
-            from gateway.run import _load_gateway_config, _platform_config_key
-            config = _load_gateway_config()
-            platform_key = _platform_config_key(getattr(source, "platform", ""))
+            try:
+                from gateway.run import _load_gateway_config, _platform_config_key
+                config = _load_gateway_config()
+                platform_key = _platform_config_key(getattr(source, "platform", ""))
+            except Exception:
+                config = {}
+                platform_key = platform_str or "telegram"
             resolved = resolve_footer_config(config, platform_key)
             fields = list(resolved.get("fields") or [])
             enabled = bool(resolved.get("enabled", True))
@@ -1030,7 +1213,7 @@ def patch_footer_line(token: object) -> str:
             tz = get_configured_timezone()
             provider = resolve_turn_provider(self, agent_result, source, config)
 
-            context_tokens = agent_result.get("last_prompt_tokens", 0) if isinstance(agent_result, dict) else 0
+            context_tokens = agent_result.get("last_prompt_tokens") if isinstance(agent_result, dict) else None
             context_length = agent_result.get("context_length") if isinstance(agent_result, dict) else None
             requested_model = agent_result.get("requested_model") if isinstance(agent_result, dict) else None
             served_model = agent_result.get("served_model") if isinstance(agent_result, dict) else None
@@ -1047,7 +1230,7 @@ def patch_footer_line(token: object) -> str:
                 try:
                     return format_runtime_footer(
                         model=effective_model,
-                        context_tokens=context_tokens,
+                        context_tokens=context_tokens if context_tokens is not None else 0,
                         context_length=context_length,
                         turn_seconds=turn_seconds,
                         requested_model=requested_model,
@@ -1158,25 +1341,28 @@ def unpatch_gateway(token: Optional[object] = None) -> Dict[str, bool]:
     Safely respects exact function identity and does not clobber foreign wrappers.
     """
     global _active_registration_token, _active_footer_wrapper, _active_persist_wrapper
+    global _active_compatibility_strategy, _active_interfaces
     status = {"footer": False, "persist": False}
 
     if token is not None and token is not _active_registration_token:
         # Outdated generation unload; no-op
         return status
 
+    active_tok = _active_registration_token
+
     try:
         from gateway import run_turn
         mixin = getattr(run_turn, "GatewayTurnMixin", None)
         if mixin:
             footer = getattr(mixin, "_hmwa_runtime_footer_line", None)
-            if footer is _active_footer_wrapper and getattr(footer, "_owner_token", None) is _active_registration_token:
+            if footer is _active_footer_wrapper and getattr(footer, "_owner_token", None) is active_tok:
                 orig = getattr(footer, "__wrapped__", None)
                 if orig:
                     mixin._hmwa_runtime_footer_line = orig
                     status["footer"] = True
 
             persist = getattr(mixin, "_hmwa_persist_turn_transcript", None)
-            if persist is _active_persist_wrapper and getattr(persist, "_owner_token", None) is _active_registration_token:
+            if persist is _active_persist_wrapper and getattr(persist, "_owner_token", None) is active_tok:
                 orig = getattr(persist, "__wrapped__", None)
                 if orig:
                     mixin._hmwa_persist_turn_transcript = orig
@@ -1184,10 +1370,13 @@ def unpatch_gateway(token: Optional[object] = None) -> Dict[str, bool]:
     except Exception as exc:
         logger.debug("Failed during unpatch_gateway: %s", exc)
 
-    if status["footer"] or status["persist"]:
+    if status["footer"] or status["persist"] or active_tok is not None:
+        cleanup_registration_receipt(active_tok)
         _active_registration_token = None
         _active_footer_wrapper = None
         _active_persist_wrapper = None
+        _active_compatibility_strategy = "unknown"
+        _active_interfaces = []
     return status
 
 
@@ -1200,9 +1389,11 @@ def register(ctx: Any = None) -> Dict[str, Any]:
     """Hermes plugin entry point. Strict signature checks fail closed.
 
     Atomic registration: rolls back if either wrapper fails.
+    Writes registration receipt recording pid, source sha256, version,
+    compatibility strategy, verified interfaces, and core identity.
     Wires ctx.on_unload callback with ownership token.
     """
-    global _active_registration_token
+    global _active_registration_token, _active_compatibility_strategy, _active_interfaces
     compatible, reason = check_gateway_compatibility()
     if not compatible:
         logger.warning(
@@ -1247,16 +1438,46 @@ def register(ctx: Any = None) -> Dict[str, Any]:
 
     _active_registration_token = token
 
+    # Write registration receipt atomically
+    try:
+        core_id = resolve_core_identity()
+        receipt_path = write_registration_receipt(
+            _active_compatibility_strategy,
+            _active_interfaces,
+            core_id,
+            token,
+        )
+    except Exception as exc:
+        logger.error("Failed to write registration receipt: %s; rolling back", exc)
+        _rollback()
+        _active_registration_token = None
+        _active_compatibility_strategy = "unknown"
+        _active_interfaces = []
+        return {
+            "status": "incompatible",
+            "reason": f"receipt write failed: {exc}",
+        }
+
+    source_sha = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
     # Wire Hermes ctx.on_unload hook
     if ctx is not None and hasattr(ctx, "on_unload") and callable(ctx.on_unload):
         ctx.on_unload(lambda: unpatch_gateway(token))
 
-    logger.info("hermes-statusline: registered (footer=%s, persist=%s)", footer_status, persist_status)
+    logger.info(
+        "hermes-statusline: registered (strategy=%s, footer=%s, persist=%s)",
+        _active_compatibility_strategy, footer_status, persist_status,
+    )
     return {
         "status": "ok",
         "footer": footer_status,
         "persist": persist_status,
         "version": VERSION,
+        "strategy": _active_compatibility_strategy,
+        "receipt": str(receipt_path),
+        "pid": os.getpid(),
+        "plugin_source_sha256": source_sha,
+        "core_identity": core_id,
     }
 
 
