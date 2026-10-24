@@ -1,11 +1,13 @@
-# hermes-statusline
+# hermes-statusline (v1.0.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-thomashuangth%2Fhermes--statusline-blue)](https://github.com/thomashuangth/hermes-statusline)
 
 A lightweight, portable statusline plugin for [Hermes Agent (NousResearch/hermes-agent)](https://github.com/NousResearch/hermes-agent). Adds a clean, compact monospace status footer to final responses across messaging platforms (such as Telegram) without core edits, extra LLM tokens, or transcript history pollution.
 
-Tested compatibility target: Hermes checkout `bf0203a794a07aac3ff764972ab9087baa4e4f4e` (2026-10-22).
+### Supported Hermes Core Targets
+- **Modern Core**: commit `bf0203a794a07aac3ff764972ab9087baa4e4f4e` (Strategy: `session_finite_v1`)
+- **Raspberry Pi Core**: commit `4f9b741a3a0284ecce31dc7e4cffde49173ec764` (Strategy: `legacy_pi_adapter`)
 
 ---
 
@@ -15,19 +17,19 @@ The plugin outputs a single compact, monospace line under the final response of 
 
 ### Standard Turn (Codex / Subscription)
 ```
-`gpt-6.1-sol · low · ctx 24% · 5h 18% (18:40) · 7j 39% (31/10 09:00)`
+`gpt-6.1-sol · low (configured) · ctx 24% · 5h 18% (18:40) · 7j 39% (31/10 09:00)`
 ```
 - **model**: Model served for this turn.
-- **effort**: Effective reasoning effort (`none`, `low`, `medium`, `high`, or `default`).
-- **ctx**: Context window token utilization (`ctx <percent>%`).
+- **effort**: Effective reasoning effort labeled `(configured)` (e.g. `low (configured)`, `medium (configured)`, `none (configured)`). Never claims provider confirmation. Absent or empty effort is omitted (avoids invented default).
+- **ctx**: Context window token utilization (`ctx <percent>%`). When token counts are missing from provider results, the field is omitted rather than inventing values.
 - **5h quota**: Consumed percentage of the 5-hour rolling session window with reset time in the configured timezone.
 - **7j quota**: Consumed percentage of the weekly window with date/time reset in the configured timezone.
 - **stale indication**: Marked with `~` if the cache is older than 30 minutes; dropped completely after 6 hours.
 
 ### Pay-As-You-Go Provider Turn (DeepSeek / Kie)
 ```
-`deepseek-flash · low · ctx 6% · credit $16.06`
-`deepseek-v4-1-flash · low · ctx 6% · credits 179.5`
+`deepseek-flash · low (configured) · ctx 6% · credit $16.06`
+`deepseek-v4-1-flash · low (configured) · ctx 6% · credits 179.5`
 ```
 On metered API providers, pay-as-you-go balances are displayed instead of subscription windows:
 - Currency balances display with currency symbol: `credit $16.06`
@@ -37,14 +39,37 @@ On metered API providers, pay-as-you-go balances are displayed instead of subscr
 
 ### Fallback Turn
 ```
-`deepseek-flash · low · ctx 6% · credit $16.06 · fallback deepseek · (recovery unknown)`
-`gpt-4o-mini · low · ctx 12% · fallback · (recovery 14:00)`
+`deepseek-flash · low (configured) · ctx 6% · credit $16.06 · fallback deepseek · (recovery unknown)`
+`gpt-4o-mini · low (configured) · ctx 12% · fallback · (recovery 14:00)`
 ```
 When fallback routing activates (`_fallback_activated` flag or requested/served model mismatch):
 - The served model is shown as the primary model field.
 - A fallback indicator (`fallback <provider>`) identifies the routing deviation.
 - A deliberate user `/model` override is NOT marked as a fallback.
 - A conservative recovery ETA is calculated based strictly on provider resets from exhausted quota windows or credential pools. If evidence is incomplete or windows are not strictly exhausted, it reports `(recovery unknown)`—never an invented time.
+
+---
+
+## Dual-Core Compatibility & Fail-Closed Seams
+
+`hermes-statusline` incorporates safe, explicit interface strategies justified by actual source analysis of both official commits:
+
+### 1. Modern Core (`session_finite_v1`)
+- Targets Hermes commit `bf0203a794a07aac3ff764972ab9087baa4e4f4e`.
+- Uses `gateway.session_finite.finite_turn_required()`.
+- Respects the tri-state ContextVar (`True`, `False`, or `None`): NEVER substitutes unconditional `False`.
+- Turns only suppress statuslines when `finite_turn_required() is True`.
+- Any exception evaluating `is_finite_turn()` fails closed (returns `True` to prevent leakage).
+- Missing `gateway.session_finite` or broken imports on modern core fail closed immediately and **NEVER fall back** to the legacy adapter.
+
+### 2. Raspberry Pi Legacy Core (`legacy_pi_adapter`)
+- Targets Hermes Pi commit `4f9b741a3a0284ecce31dc7e4cffde49173ec764`.
+- **Exact-source cryptographic guard**: The legacy adapter activates **ONLY** when:
+  1. Module `gateway.session_finite` is genuinely absent (`importlib.util.find_spec("gateway.session_finite") is None`), **AND**
+  2. The on-disk `gateway/run_turn.py` file hash matches the official pinned Pi core commit SHA256 (`dc0829d1d8c7d521502f847442ecb3386b7671268047372e22f6da263417be66`).
+  If the hash does not match, registration fails closed (`{"status": "incompatible"}`).
+- **Platform Scope Guard**: On the legacy Pi core, Telegram is the proven supported messaging platform. If the turn source is not Telegram (or an unknown surface), the plugin preserves exact old native behavior.
+- Does not invent artificial ContextVars pretending to be core finite state.
 
 ---
 
@@ -56,46 +81,74 @@ When fallback routing activates (`_fallback_activated` flag or requested/served 
 
 ---
 
-## Installation
+## Gateway Hot Reload & Activation
 
-The CLI install syntax below uses the independently verified Hermes plugin commands:
-
-### Recommended: Direct Plugin Install
-```bash
-# Auto-enable immediately:
-hermes plugins install thomashuangth/hermes-statusline --enable
-
-# Or using the full Git URL:
-hermes plugins install https://github.com/thomashuangth/hermes-statusline --enable
+### Why `hermes plugins enable` is a No-Op When Already Enabled
+In the two pinned Hermes Agent cores (`hermes_cli/plugins.py`), running `hermes plugins enable hermes-statusline` on a plugin that is already listed in `plugins.enabled` in `config.yaml` immediately prints:
+```text
+Plugin 'hermes-statusline' is already enabled.
 ```
+and returns without signaling the running gateway daemon. **It does not reload plugin code or refresh in-memory handlers.**
 
-### Headless / CI / Docker Automation
-```bash
-# Answer dependency consent non-interactively:
-hermes plugins install thomashuangth/hermes-statusline --yes-deps --enable
+### Official Reload Architecture: Gateway Control Socket
+To reload plugins in a live, running Hermes gateway without restarting or interrupting active sessions, use the official control socket API (`gateway/control_socket.py`):
+
+```python
+from gateway.control_socket import reload_gateway_plugins
+from hermes_constants import get_hermes_home
+from pathlib import Path
+
+# Exact core signature:
+# reload_gateway_plugins(home: Path, *, profile_home: Optional[Path] = None, timeout: float = 30.0) -> Optional[dict[str, Any]]
+home = Path(get_hermes_home())
+result = reload_gateway_plugins(home)
+# Returns {"reloaded": True, "plugins": [...], ...} when live reload succeeds.
 ```
+> [!NOTE]
+> Do not reset the session or restart the gateway to apply this plugin. The control-socket request performs forced plugin discovery; this plugin restores/re-wraps its own in-memory methods via its unload callback. Generic native-handler removal has separate Hermes lifecycle limitations: this is not a promise that every plugin handler can be unwired live.
+>
+> This plugin wraps **private core interfaces**, not a public statusline SDK hook. Compatibility is deliberately constrained and must be revalidated after core upgrades. Repository CI is not catalog admission; a catalog validator may reject these private wrappers.
 
-### Install Disabled, Enable Later
-```bash
-hermes plugins install thomashuangth/hermes-statusline --no-enable
-hermes plugins enable hermes-statusline
-```
+### Human Activation & Receipt Verification Procedure
+1. Verify the plugin is installed and enabled in configuration:
+   ```bash
+   hermes plugins list
+   ```
+2. After updating the installed plugin directory, trigger reload **as the gateway's OS user and profile**, using the installation-bound runtime rather than system Python. The following preserves the bootstrap emitted by the two pinned cores and changes only its final entry point:
+   ```bash
+   python3 - <<'PY'
+   import json, subprocess
+   argv = json.loads(subprocess.check_output(["hermes", "--print-runtime-command"], text=True))
+   index = argv.index("-c") + 1
+   entry = "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+   if not argv[index].endswith(entry):
+       raise SystemExit("Unsupported launcher shape: stop and inspect this installation.")
+   lines = [
+       "from pathlib import Path",
+       "import json",
+       "from hermes_constants import get_hermes_home",
+       "from gateway.control_socket import reload_gateway_plugins",
+       "home = Path(get_hermes_home())",
+       "result = reload_gateway_plugins(home, profile_home=home)",
+       "print(json.dumps(result, indent=2))",
+       "if not isinstance(result, dict) or result.get('reloaded') is not True:",
+       "    raise SystemExit('No successful live reload acknowledgement.')",
+   ]
+   argv[index] = argv[index][:-len(entry)] + "exec(" + repr("\n".join(lines)) + ")"
+   subprocess.run(argv, check=True)
+   PY
+   ```
+3. Read `gateway.pid` as JSON and obtain its `pid`; inspect **only** the matching `$HERMES_HOME/state/hermes_statusline/loaded-<pid>.json`. Compare `plugin_source_sha256` with the installed `__init__.py`, `version` with `1.0.1`, and `core_identity.run_turn_sha256` with the actual imported source. A receipt from a CLI/test PID or an old process is not evidence for the live gateway. Confirm a new timestamp after reload; then observe an ordinary final response in the intended Telegram conversation.
+   **Receipt fields:**
+   - `pid`: Process ID of the running Hermes gateway.
+   - `plugin_source_sha256`: SHA256 of `__init__.py` verifying exact code running.
+   - `version`: Plugin version (`1.0.1`).
+   - `compatibility_strategy`: `session_finite_v1` (modern core) or `legacy_pi_adapter` (Raspberry Pi).
+   - `interfaces`: Verified private seams.
+   - `core_identity`: Actual `run_turn_path`, `run_turn_sha256`, and verified `core_commit`.
+   - `registered_at`: ISO 8601 UTC timestamp.
 
-### Manual Installation
-```bash
-# Clone directly to your plugins directory:
-git clone https://github.com/thomashuangth/hermes-statusline "${HERMES_HOME:-$HOME/.hermes}/plugins/hermes-statusline"
-
-# Enable plugin:
-hermes plugins enable hermes-statusline
-```
-
-### Management
-```bash
-# Disable or remove:
-hermes plugins disable hermes-statusline
-hermes plugins remove hermes-statusline
-```
+If receipt creation fails (e.g., read-only disk), registration atomically rolls back both wrappers and fails closed.
 
 ---
 
@@ -107,39 +160,35 @@ Enable the runtime footer and configure fields in your Hermes configuration:
 # Enable runtime footer for Telegram
 hermes config set display.platforms.telegram.runtime_footer.enabled true
 
-# Configure active fields (recommend model, effort, ctx, quota - no duplicate served_model)
+# Configure active fields (model, effort, ctx, quota)
 hermes config set display.platforms.telegram.runtime_footer.fields '["model","effort","ctx","quota"]'
 ```
 
 ### Timezone
-The default timezone is `UTC`. You can configure your local timezone by setting the environment variable:
+The default timezone is `UTC`. Configure your local timezone:
 ```bash
 export HERMES_STATUSLINE_TZ="Europe/Paris"
 # or
 export TZ="America/New_York"
 ```
-Reset timestamps and recovery ETAs will automatically format according to the configured timezone, with full daylight saving time (DST) awareness via standard library `zoneinfo`.
 
 ---
 
-## Local Quota Cache Architecture (Zero Network Path)
+## Zero-Network Quota & Cache Normalization
 
-The plugin implements a **strictly zero-network path**: it contains no network calls, credentials reading, or outbound requests. Quotas and credit balances are optional and absent by default. They are read purely from local cache files written by your external cron jobs or background scripts:
+The plugin maintains a strict **zero-network path**: it contains no network calls, credentials reading, or outbound requests. Quotas and credit balances are optional, absent by default, and read solely from local cache files:
 
 ### Quota Cache Schema (`$HERMES_HOME/state/provider_usage_cache.json`)
 ```json
 {
   "provider": "openai-codex",
-  "source": "usage_api",
   "fetched_at": 1729759200.0,
   "windows": {
     "session": {
-      "label": "5-Hour Limit",
       "used_percent": 18.0,
       "resets_at": "2026-10-24T18:40:00+00:00"
     },
     "weekly": {
-      "label": "Weekly Limit",
       "used_percent": 39.0,
       "resets_at": "2026-10-31T09:00:00+00:00"
     }
@@ -166,43 +215,27 @@ The plugin implements a **strictly zero-network path**: it contains no network c
 }
 ```
 
-If cache files are absent, unparseable, or expired (> 6 hours), the quota field safely fails closed and is omitted from the footer. There is **no automatic network refresh** and no background cron task is installed automatically.
-
----
-
-## Internal / Private Seam Compatibility Risks
-
-This plugin interfaces in-memory with private gateway seams without modifying core files on disk:
-- `GatewayTurnMixin._hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds)`
-- `GatewayTurnMixin._hmwa_persist_turn_transcript(self, **kwargs)`
-- `gateway.session_finite.finite_turn_required()` (0 arguments)
-
-### Catalog Admission Notice:
-> [!IMPORTANT]
-> Running `hermes plugins validate repo` **fails with "no core override"** by design, because this plugin wraps `GatewayTurnMixin` in memory. `hermes-statusline` is an unsupported private-seam extension and is **NOT catalog-admissible** for the official plugin catalog. Direct installation via Git URL (`hermes plugins install https://github.com/thomashuangth/hermes-statusline --enable`) or local directory clone is the supported distribution method. Do not submit this plugin to the public catalog index.
-
-### Mitigations & Fail-Closed Design:
-1. **Strict Positional & Coroutine Signature Checks**: `check_gateway_compatibility()` validates the exact positional parameter kinds of `_hmwa_runtime_footer_line` and confirms that `_hmwa_persist_turn_transcript` is a coroutine function accepting keyword arguments `response` and `agent_result`. It also verifies that `gateway.session_finite.finite_turn_required` is a 0-argument callable. If any interface deviates, the plugin **fails closed** (`{"status": "incompatible"}`) and message delivery proceeds normally without decoration.
-2. **Atomic Registration & Rollback**: Registration snapshots exact pre-registration functions and active tokens; if either wrapper fails, pre-registration state is atomically restored without leaving half-patched wrappers.
-3. **Hermes Lifecycle Wiring**: `register(ctx)` registers a restoration closure with `ctx.on_unload(callback)`.
-4. **Ownership Token & Function Identity**: Unloading uses exact function identity and an owner token. An unload callback from an older generation cannot remove a newer generation, and foreign decorators wrapping the mixin (e.g., using `functools.wraps`) are never stripped.
-5. **Runtime Exception Safety**: Exceptions after `original(...)` are caught and logged, returning the native output to guarantee message delivery is never disrupted.
-6. **Zero-Network Recovery ETA**: Recovery ETA never calls `credential_pool.load_pool` or reads disk credentials. It calculates recovery exclusively from local quota cache or provably matching live in-memory pool objects.
-7. **No Live Telegram Proof**: Testing has been performed against self-contained unit and integration stubs matching checkout `bf0203a794a07aac3ff764972ab9087baa4e4f4e`. No live Telegram bot tokens or credentials were used.
+### Optional Normalizer Script (`scripts/normalize_usage.py`)
+To populate `provider_usage_cache.json` without custom code, use the included standalone normalizer:
+```bash
+# Read official hermes usage --json from stdin and update cache atomically:
+hermes usage --json | python3 scripts/normalize_usage.py --write
+```
+- **Opt-in only**: Must be executed by the operator; no automated cron or credential fetches are installed.
+- Consumes stdin only, never synthesizes quota values, and performs zero network egress.
 
 ---
 
 ## Running Tests
 
-All tests use standard library `unittest` and run with complete filesystem isolation. Neither `$HOME` nor `$HERMES_HOME` is ever touched:
+All tests enforce complete sandbox isolation. Tests must set temporary `HOME` and `HERMES_HOME` before Python launches and before imports, with `HERMES_DISABLE_LAZY_INSTALLS=1`:
 
 ```bash
+# Run unit tests:
 ./scripts/run_tests.sh
-```
 
-To run with an alternate Python interpreter:
-```bash
-PYTHON=python3.11 ./scripts/run_tests.sh
+# Run real-core integration tests against an explicit core checkout:
+HERMES_TEST_CORE=/path/to/extracted/core ./scripts/run_tests.sh
 ```
 
 ---
